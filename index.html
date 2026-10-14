@@ -1744,6 +1744,7 @@
     <div class="call-top-bar">
       <div id="call-partner-display" style="font-size: 20px; font-weight: 800;">@ник</div>
       <div id="call-timer-display" style="font-size: 14px; color: var(--text-sub);">Соединение...</div>
+      <div id="call-mic-status-display" style="display: none; font-size: 12.5px; color: #fbbf24; background: rgba(245, 158, 11, 0.16); border: 1px solid rgba(245, 158, 11, 0.45); padding: 5px 12px; border-radius: 99px; font-weight: 600; text-align: center; margin-top: 4px; max-width: 90vw;"></div>
     </div>
     <div class="call-center-stage">
       <div class="call-avatar-pulse" id="call-audio-avatar">?</div>
@@ -2042,6 +2043,9 @@
 
           <button class="auth-btn" id="settings-logout-btn" style="background: rgba(239, 68, 68, 0.14); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); margin-top: 4px; flex-shrink: 0;">
             Выйти из аккаунта
+          </button>
+          <button class="auth-btn" id="settings-delete-account-btn" style="background: rgba(239, 68, 68, 0.28); color: #fecaca; border: 1px solid rgba(239, 68, 68, 0.5); margin-top: 6px; flex-shrink: 0;">
+            🗑️ Удалить аккаунт навсегда
           </button>
         </div>
       </section>
@@ -2580,11 +2584,12 @@
   <!-- CLEAR CHAT MODAL -->
   <div id="clear-chat-modal" class="modal-overlay" style="display: none;">
     <div class="auth-card" style="max-width: 340px;">
-      <div style="font-size: 28px; margin-bottom: 6px;">🧹</div>
-      <h2>Очистить диалог</h2>
-      <p>Выберите вариант очистки сообщений:</p>
-      <button id="clear-for-me-btn" class="auth-btn" style="background: rgba(255,255,255,0.1); margin-bottom: 10px;">Очистить только у меня</button>
-      <button id="clear-for-both-btn" class="auth-btn" style="background: var(--danger); margin-bottom: 10px;">Очистить для обоих собеседников 💥</button>
+      <div style="font-size: 28px; margin-bottom: 6px;">⚙️</div>
+      <h2>Управление диалогом</h2>
+      <p>Выберите действие с сообщениями или контактом:</p>
+      <button id="clear-for-me-btn" class="auth-btn" style="background: rgba(255,255,255,0.1); margin-bottom: 10px;">🧹 Очистить только у меня</button>
+      <button id="clear-for-both-btn" class="auth-btn" style="background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); margin-bottom: 10px;">💥 Очистить для обоих собеседников</button>
+      <button id="delete-contact-btn" class="auth-btn" style="background: var(--danger); margin-bottom: 10px;">🗑️ Удалить контакт</button>
       <button id="clear-cancel-btn" class="auth-btn" style="background: transparent; color: var(--text-sub); padding: 8px;">Отмена</button>
     </div>
   </div>
@@ -2609,6 +2614,7 @@
       createUserWithEmailAndPassword, 
       signInWithEmailAndPassword,
       signOut,
+      deleteUser,
       onAuthStateChanged
     } from "https://www.gstatic.com/firebasejs/10.9.0/firebase-auth.js";
     import { 
@@ -2628,7 +2634,8 @@
       where,
       orderBy, 
       serverTimestamp,
-      arrayUnion
+      arrayUnion,
+      arrayRemove
     } from "https://www.gstatic.com/firebasejs/10.9.0/firebase-firestore.js";
 
     const ONESIGNAL_APP_ID = "31d55b1b-ee69-4349-ae37-bc50771a4e22"; 
@@ -2808,6 +2815,17 @@
     let isMicMuted = false;
     let isVideoOff = false;
     let currentCameraDeviceId = null;
+    let currentAudioDeviceId = null;
+    let isCallSessionActive = false;
+    let currentCallRole = null;
+    let currentCallPartner = null;
+    let isRecoveringMic = false;
+    let isRecoveringVideo = false;
+    let isReconnectingIce = false;
+    let micRecoveryRetryTimeout = null;
+    let iceDisconnectTimeout = null;
+    let lastProcessedOfferSdp = null;
+    let lastProcessedAnswerSdp = null;
     let ringtoneInterval = null;
     let candidateQueue = [];
     let sharedAudioCtx = null;
@@ -3005,6 +3023,7 @@
     const callHangupBtn = document.getElementById("call-hangup-btn");
     const callAudioAvatar = document.getElementById("call-audio-avatar");
     const callTimerDisplay = document.getElementById("call-timer-display");
+    const callMicStatusDisplay = document.getElementById("call-mic-status-display");
     const remoteVideoElem = document.getElementById("remote-video-elem");
     const localVideoElem = document.getElementById("local-video-elem");
     const remoteAudioElem = document.getElementById("remote-audio-elem");
@@ -3051,6 +3070,7 @@
     const clearChatModal = document.getElementById("clear-chat-modal");
     const clearForMeBtn = document.getElementById("clear-for-me-btn");
     const clearForBothBtn = document.getElementById("clear-for-both-btn");
+    const deleteContactBtn = document.getElementById("delete-contact-btn");
     const clearCancelBtn = document.getElementById("clear-cancel-btn");
 
     // Populate Quick Emoji Popover
@@ -3228,8 +3248,7 @@
       const userDocRef = doc(db, "users", targetUser);
       unsubscribePresence = onSnapshot(userDocRef, (snap) => {
         if (!snap.exists()) {
-          currentChatStatus.textContent = "не в сети";
-          currentChatStatus.className = "chat-header-status";
+          removeContactLocallyAndRemotely(targetUser, { isAccountDeleted: true }).catch(() => {});
           return;
         }
         const d = snap.data();
@@ -3254,9 +3273,10 @@
       const now = Date.now();
       if (now - lastPresenceUpdate < 2000) return;
       lastPresenceUpdate = now;
+      const effectiveOnline = Boolean(isOnlineState || isCallSessionActive || currentCallId);
       setDoc(doc(db, "users", currentUsername), {
-        sessionActive: isOnlineState,
-        isOnline: isOnlineState,
+        sessionActive: effectiveOnline,
+        isOnline: effectiveOnline,
         lastOnline: serverTimestamp(),
         lastOnlineMillis: Date.now()
       }, { merge: true }).catch(() => {});
@@ -3744,12 +3764,63 @@
       }
     });
 
+    let pendingConfirmAction = "logout";
+
     function promptLogoutConfirmation() {
+      pendingConfirmAction = "logout";
+      document.getElementById("confirm-modal-title").textContent = "Выйти из аккаунта?";
+      document.getElementById("confirm-modal-text").textContent = "Вы уверены, что хотите выйти? Для повторного входа понадобятся ваш Email и пароль.";
+      document.getElementById("confirm-ok-btn").textContent = "Выйти";
       confirmModal.style.display = "flex";
+    }
+
+    function promptDeleteOwnAccountConfirmation() {
+      if (!currentUsername) return;
+      if (amICreator()) {
+        showToast("Аккаунт создателя защищён от удаления");
+        return;
+      }
+      pendingConfirmAction = "delete_account";
+      document.getElementById("confirm-modal-title").textContent = "Удалить аккаунт навсегда?";
+      document.getElementById("confirm-modal-text").textContent = `Аккаунт @${currentUsername} будет полностью удалён и пропадёт из чатов и контактов у всех пользователей.`;
+      document.getElementById("confirm-ok-btn").textContent = "Удалить навсегда";
+      confirmModal.style.display = "flex";
+    }
+
+    async function deleteOwnAccountPermanently() {
+      if (!currentUsername) return;
+      const usernameToDelete = currentUsername;
+      try { terminateCall(); } catch (e) {}
+      await cleanupAllListeners();
+
+      try {
+        await purgeDeletedAccountEverywhere(usernameToDelete);
+      } catch (e) {}
+
+      resetLocalSessionMemory();
+      appContainer.classList.remove("chat-active");
+
+      try {
+        if (auth.currentUser) {
+          await deleteUser(auth.currentUser).catch(async () => {
+            await signOut(auth).catch(() => {});
+          });
+        } else {
+          await signOut(auth).catch(() => {});
+        }
+      } catch (e) {}
+
+      showAuthModal();
+      setAuthMode(true);
+      showToast(`Аккаунт @${usernameToDelete} удалён навсегда 🗑️`);
     }
 
     document.getElementById("settings-logout-btn").addEventListener("click", promptLogoutConfirmation);
     document.getElementById("settings-logout-icon").addEventListener("click", promptLogoutConfirmation);
+    const deleteOwnAccBtn = document.getElementById("settings-delete-account-btn");
+    if (deleteOwnAccBtn) {
+      deleteOwnAccBtn.addEventListener("click", promptDeleteOwnAccountConfirmation);
+    }
 
     document.getElementById("confirm-cancel-btn").addEventListener("click", () => {
       confirmModal.style.display = "none";
@@ -3757,7 +3828,11 @@
 
     document.getElementById("confirm-ok-btn").addEventListener("click", () => {
       confirmModal.style.display = "none";
-      logoutUser(false);
+      if (pendingConfirmAction === "delete_account") {
+        deleteOwnAccountPermanently();
+      } else {
+        logoutUser(false);
+      }
     });
 
     confirmModal.addEventListener("click", (e) => {
@@ -4171,10 +4246,47 @@
     startWipeWatcher();
 
     function handleVisibilityChange() {
-      if (currentUsername) sendPresenceUpdate(!document.hidden);
+      if (currentUsername) {
+        sendPresenceUpdate(document.visibilityState === "visible");
+      }
+      // ВАЖНО: при переходе в hidden НЕ выключаем микрофон и НЕ завершаем WebRTC-соединение.
+      // При возвращении пользователя (visible) проверяем поток микрофона и состояние WebRTC.
+      if (document.visibilityState === "visible" && (isCallSessionActive || currentCallId)) {
+        ensureCallMediaAndConnection("visibility_visible").catch(() => {});
+      }
     }
+
     function handlePageHide() {
-      if (currentUsername) sendPresenceUpdate(false);
+      // Не отключаем микрофон и не сбрасываем звонок при сворачивании/уходе из браузера
+      if (currentUsername && !isCallSessionActive && !currentCallId) {
+        sendPresenceUpdate(false);
+      }
+    }
+
+    function handlePageShow() {
+      if (currentUsername) sendPresenceUpdate(true);
+      if (isCallSessionActive || currentCallId) {
+        ensureCallMediaAndConnection("pageshow").catch(() => {});
+      }
+    }
+
+    function handleWindowFocus() {
+      if (currentUsername) sendPresenceUpdate(true);
+      if (document.visibilityState === "visible" && (isCallSessionActive || currentCallId)) {
+        ensureCallMediaAndConnection("window_focus").catch(() => {});
+      }
+    }
+
+    function handlePageFreeze() {
+      // При заморозке страницы ОС не останавливаем MediaStreamTrack вручную,
+      // чтобы браузер мог сохранить или корректно восстановить сессию после resume.
+    }
+
+    function handlePageResume() {
+      if (currentUsername) sendPresenceUpdate(true);
+      if (isCallSessionActive || currentCallId) {
+        ensureCallMediaAndConnection("page_resume").catch(() => {});
+      }
     }
 
     async function initAppSession(username) {
@@ -4228,8 +4340,17 @@
 
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("pageshow", handlePageShow);
+      window.removeEventListener("focus", handleWindowFocus);
+      document.removeEventListener("freeze", handlePageFreeze);
+      document.removeEventListener("resume", handlePageResume);
+
       document.addEventListener("visibilitychange", handleVisibilityChange);
       window.addEventListener("pagehide", handlePageHide);
+      window.addEventListener("pageshow", handlePageShow);
+      window.addEventListener("focus", handleWindowFocus);
+      document.addEventListener("freeze", handlePageFreeze);
+      document.addEventListener("resume", handlePageResume);
 
       if (unsubscribeUserDoc) { unsubscribeUserDoc(); unsubscribeUserDoc = null; }
       unsubscribeUserDoc = onSnapshot(userDocRef, (snap) => {
@@ -4252,8 +4373,10 @@
           myCurrentAvatarUrl = d.avatarUrl || null;
           updateProfileUI();
           updateSettingsUI();
-          const remoteContacts = d.contacts || [];
-          remoteContacts.forEach(c => knownContacts.add(c));
+          const remoteContacts = Array.isArray(d.contacts)
+            ? d.contacts.map(c => sanitizeUsername(c)).filter(Boolean)
+            : [];
+          knownContacts = new Set(remoteContacts);
           loadContactsProfilesAndRender();
         }
       }, () => {});
@@ -4267,6 +4390,95 @@
       }
     }
 
+    function closeActiveChatView() {
+      appContainer.classList.remove("chat-active");
+      activeChatUser = null;
+      if (unsubscribePresence) { unsubscribePresence(); unsubscribePresence = null; }
+      if (unsubscribeTyping) { unsubscribeTyping(); unsubscribeTyping = null; }
+      if (unsubscribeMessages) { unsubscribeMessages(); unsubscribeMessages = null; }
+      clearAttachment();
+      clearReply();
+      stopVoiceRecording(false);
+      currentChatTitle.textContent = "Выберите контакт";
+      headerVerifiedIcon.style.display = "none";
+      currentChatAvatar.textContent = "?";
+      currentChatAvatar.style.backgroundImage = "";
+      currentChatAvatar.style.background = "linear-gradient(135deg, #3b82f6, #1d4ed8)";
+      currentChatStatus.textContent = "не в сети";
+      currentChatStatus.className = "chat-header-status";
+      callButtonsGroup.style.display = "none";
+      chatMenuBtn.style.display = "none";
+      messagesContainer.innerHTML = `<div class="chat-empty-hint"><span class="chat-empty-hint-emoji">💬</span>Выберите чат слева или создайте новый диалог, чтобы начать общение.</div>`;
+    }
+
+    async function removeContactLocallyAndRemotely(targetUsername, options = {}) {
+      const cleanTarget = sanitizeUsername(targetUsername);
+      if (!cleanTarget || cleanTarget === "phonogramm") return;
+
+      const wasInContacts = knownContacts.has(cleanTarget);
+      const wasActiveChat = (activeChatUser === cleanTarget);
+
+      knownContacts.delete(cleanTarget);
+      delete contactsProfiles[cleanTarget];
+      delete contactsAvatars[cleanTarget];
+
+      if (myUserData && Array.isArray(myUserData.contacts)) {
+        myUserData.contacts = myUserData.contacts.filter(c => sanitizeUsername(c) !== cleanTarget);
+      }
+
+      if (wasActiveChat) {
+        closeActiveChatView();
+        if (options.isAccountDeleted) {
+          showToast(`Аккаунт @${cleanTarget} был удалён`);
+        }
+      }
+
+      renderChatList(Array.from(knownContacts));
+      renderContactsList();
+
+      if (currentUsername && (wasInContacts || options.forceRemoteRemove)) {
+        try {
+          await setDoc(doc(db, "users", currentUsername), {
+            contacts: arrayRemove(cleanTarget)
+          }, { merge: true });
+        } catch (e) {}
+      }
+
+      if (options.clearHistoryForMe && currentUsername) {
+        try {
+          const chatId = getChatId(currentUsername, cleanTarget);
+          const snap = await getDocs(collection(db, `dm_${chatId}`));
+          const ops = [];
+          snap.forEach(d => {
+            ops.push(setDoc(d.ref, { deletedFor: arrayUnion(currentUsername) }, { merge: true }).catch(() => {}));
+          });
+          await Promise.allSettled(ops);
+        } catch (e) {}
+      }
+    }
+
+    async function purgeDeletedAccountEverywhere(deletedUsername) {
+      const cleanU = sanitizeUsername(deletedUsername);
+      if (!cleanU || cleanU === "phonogramm") return;
+
+      try {
+        const allUsersSnap = await getDocs(collection(db, "users"));
+        const ops = [];
+        allUsersSnap.forEach(uDoc => {
+          const uId = sanitizeUsername(uDoc.id);
+          if (uId && uId !== cleanU) {
+            const uData = uDoc.data() || {};
+            if (Array.isArray(uData.contacts) && uData.contacts.some(c => sanitizeUsername(c) === cleanU)) {
+              ops.push(setDoc(uDoc.ref, { contacts: arrayRemove(cleanU) }, { merge: true }).catch(() => {}));
+            }
+          }
+        });
+        await Promise.allSettled(ops);
+      } catch (e) {}
+
+      await deleteDoc(doc(db, "users", cleanU)).catch(() => {});
+    }
+
     function startVerifiedUsersListener() {
       if (unsubscribeVerifiedUsers) unsubscribeVerifiedUsers();
       unsubscribeVerifiedUsers = onSnapshot(collection(db, "users"), (snapshot) => {
@@ -4276,7 +4488,12 @@
           const data = change.doc.data();
           if (change.type === "removed") {
             verifiedUsersSet.delete(u);
-            delete contactsProfiles[u];
+            if (knownContacts.has(u) || activeChatUser === u) {
+              removeContactLocallyAndRemotely(u, { isAccountDeleted: true, forceRemoteRemove: true }).catch(() => {});
+            } else {
+              delete contactsProfiles[u];
+              delete contactsAvatars[u];
+            }
             changed = true;
             return;
           }
@@ -4302,8 +4519,7 @@
     async function loadContactsProfilesAndRender() {
       const contactsArr = Array.from(knownContacts);
       for (const contact of contactsArr) {
-        if (contact && contact !== "phonogramm" && contactsAvatars[contact] === undefined) {
-          contactsAvatars[contact] = "";
+        if (contact && contact !== "phonogramm") {
           getDoc(doc(db, "users", contact)).then(uSnap => {
             if (uSnap.exists()) {
               const uDat = uSnap.data();
@@ -4312,11 +4528,14 @@
               if (uDat.isVerified || isAdministrator(contact, uDat.email)) verifiedUsersSet.add(sanitizeUsername(contact));
               renderChatList(Array.from(knownContacts));
               renderContactsList();
+            } else {
+              // Аккаунт был удалён — убираем его из чатов и контактов
+              removeContactLocallyAndRemotely(contact, { isAccountDeleted: true, forceRemoteRemove: true }).catch(() => {});
             }
           }).catch(() => {});
         }
       }
-      renderChatList(contactsArr);
+      renderChatList(Array.from(knownContacts));
       renderContactsList();
     }
 
@@ -4876,6 +5095,23 @@
       }
     });
 
+    if (deleteContactBtn) {
+      deleteContactBtn.addEventListener("click", async () => {
+        if (!activeChatUser || activeChatUser === "phonogramm" || !currentUsername) return;
+        const targetToRemove = activeChatUser;
+        clearChatModal.style.display = "none";
+        try {
+          await removeContactLocallyAndRemotely(targetToRemove, {
+            forceRemoteRemove: true,
+            clearHistoryForMe: true
+          });
+          showToast(`Контакт @${targetToRemove} удалён из чатов и контактов 🗑️`);
+        } catch (e) {
+          showToast("Ошибка удаления контакта: " + e.message);
+        }
+      });
+    }
+
     function clearAttachment() {
       currentAttachment = null;
       attachmentPreviewBar.style.display = "none";
@@ -5297,8 +5533,9 @@
           };
 
           card.querySelector('[data-act="delete"]').onclick = async () => {
-            await deleteDoc(doc(db, "users", u)).catch(() => {});
-            showToast(`Аккаунт @${u} удалён из базы 🗑`);
+            await purgeDeletedAccountEverywhere(u);
+            await removeContactLocallyAndRemotely(u, { forceRemoteRemove: true });
+            showToast(`Аккаунт @${u} удалён из базы, чатов и контактов 🗑`);
             loadAdminUsersList();
           };
         }
@@ -5925,6 +6162,10 @@
 
     micRecordBtn.addEventListener("click", async () => {
       if (!activeChatUser || activeChatUser === "phonogramm") return;
+      if (isCallSessionActive || currentCallId) {
+        showToast("Во время активного звонка запись голосовых сообщений недоступна");
+        return;
+      }
       if (isLocalFileContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { 
         showToast("Запись голоса заблокирована: запустите через веб-сервер (127.0.0.1) или HTTPS"); 
         return; 
@@ -5989,39 +6230,571 @@
     });
 
     // ==========================================
-    // ЗВОНКИ WEBRTC (С ЗАЩИТОЙ ОТ ЗАВИСАНИЙ)
+    // ЗВОНКИ WEBRTC (С СОХРАНЕНИЕМ И АВТОВОССТАНОВЛЕНИЕМ МИКРОФОНА)
     // ==========================================
-    async function acquireUserMediaSafely(type) {
+    function setCallMicStatus(message, isError = false) {
+      if (!callMicStatusDisplay) return;
+      if (!message) {
+        callMicStatusDisplay.style.display = "none";
+        callMicStatusDisplay.textContent = "";
+        return;
+      }
+      callMicStatusDisplay.textContent = message;
+      callMicStatusDisplay.style.display = "block";
+      if (isError) {
+        callMicStatusDisplay.style.color = "#fca5a5";
+        callMicStatusDisplay.style.background = "rgba(239, 68, 68, 0.2)";
+        callMicStatusDisplay.style.borderColor = "rgba(239, 68, 68, 0.5)";
+      } else {
+        callMicStatusDisplay.style.color = "#fbbf24";
+        callMicStatusDisplay.style.background = "rgba(245, 158, 11, 0.16)";
+        callMicStatusDisplay.style.borderColor = "rgba(245, 158, 11, 0.45)";
+      }
+    }
+
+    function formatMediaError(err) {
+      if (!err) return "Неизвестная ошибка доступа к микрофону";
+      const name = err.name || "";
+      if (name === "NotAllowedError" || name === "PermissionDeniedError" || name === "SecurityError") {
+        return "Доступ к микрофону запрещён (NotAllowedError). Разрешите микрофон в настройках браузера.";
+      }
+      if (name === "NotReadableError" || name === "TrackStartError") {
+        return "Микрофон временно недоступен — пытаемся восстановить…";
+      }
+      if (name === "AbortError") {
+        return "Микрофон временно недоступен — пытаемся восстановить…";
+      }
+      if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+        return "Микрофон не найден на устройстве.";
+      }
+      if (name === "OverconstrainedError") {
+        return "Выбранный микрофон недоступен — переключаемся на стандартный…";
+      }
+      return err.message || "Ошибка доступа к микрофону";
+    }
+
+    function getAudioConstraints(preferredDeviceId = currentAudioDeviceId) {
+      const base = {
+        echoCancellation: { ideal: true },
+        noiseSuppression: { ideal: true },
+        autoGainControl: { ideal: true },
+        channelCount: { ideal: 1 }
+      };
+      if (preferredDeviceId) {
+        base.deviceId = { ideal: preferredDeviceId };
+      }
+      return base;
+    }
+
+    function hasLiveAudioTrack(stream = localStream) {
+      if (!stream) return false;
+      const tracks = stream.getAudioTracks();
+      return tracks.some(t => t && t.readyState === "live");
+    }
+
+    function hasLiveVideoTrack(stream = localStream) {
+      if (!stream) return false;
+      const tracks = stream.getVideoTracks();
+      return tracks.some(t => t && t.readyState === "live");
+    }
+
+    function syncMicMuteState() {
+      if (localStream) {
+        localStream.getAudioTracks().forEach(track => {
+          track.enabled = !isMicMuted;
+        });
+      }
+      if (callMuteMicBtn) {
+        callMuteMicBtn.classList.toggle("active-off", isMicMuted);
+      }
+    }
+
+    function syncVideoMuteState() {
+      if (localStream) {
+        localStream.getVideoTracks().forEach(track => {
+          track.enabled = !isVideoOff;
+        });
+      }
+      if (callToggleVideoBtn) {
+        callToggleVideoBtn.classList.toggle("active-off", isVideoOff);
+      }
+    }
+
+    function bindAudioTrackListeners(track) {
+      if (!track) return;
+      try {
+        const settings = track.getSettings ? track.getSettings() : {};
+        if (settings && settings.deviceId) {
+          currentAudioDeviceId = settings.deviceId;
+        }
+      } catch (e) {}
+
+      // Всегда синхронизируем пользовательское состояние mute/unmute
+      track.enabled = !isMicMuted;
+
+      track.onended = () => {
+        if (!isCallSessionActive && !currentCallId) return;
+        setCallMicStatus("Микрофон временно недоступен — пытаемся восстановить…");
+        if (document.visibilityState === "visible") {
+          recoverMicrophoneTrack("track_ended").catch(() => {});
+        } else {
+          // Если браузер/ОС остановил трек в фоне, пробуем мягко восстановить;
+          // если в фоне запрещено, он автоматически восстановится при возврате в visible.
+          recoverMicrophoneTrack("track_ended_bg").catch(() => {});
+        }
+      };
+
+      track.onmute = () => {
+        if (!isCallSessionActive && !currentCallId) return;
+        setCallMicStatus("Микрофон временно недоступен — пытаемся восстановить…");
+        clearTimeout(micRecoveryRetryTimeout);
+        micRecoveryRetryTimeout = setTimeout(() => {
+          if (!isCallSessionActive && !currentCallId) return;
+          if (document.visibilityState === "visible" && (track.readyState === "ended" || track.muted)) {
+            recoverMicrophoneTrack("track_muted_timeout").catch(() => {});
+          }
+        }, 1200);
+      };
+
+      track.onunmute = () => {
+        if (!isCallSessionActive && !currentCallId) return;
+        clearTimeout(micRecoveryRetryTimeout);
+        track.enabled = !isMicMuted;
+        setCallMicStatus(null);
+      };
+    }
+
+    function bindVideoTrackListeners(track) {
+      if (!track) return;
+      try {
+        const settings = track.getSettings ? track.getSettings() : {};
+        if (settings && settings.deviceId) {
+          currentCameraDeviceId = settings.deviceId;
+        }
+      } catch (e) {}
+      track.enabled = !isVideoOff;
+      track.onended = () => {
+        if (!isCallSessionActive && !currentCallId) return;
+        if (currentCallType === "video" && !isVideoOff && document.visibilityState === "visible") {
+          recoverVideoTrack("video_track_ended").catch(() => {});
+        }
+      };
+    }
+
+    async function acquireUserMediaSafely(type, options = {}) {
       if (isLocalFileContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error("Доступ к микрофону/камере заблокирован для локального файла. Откройте через сервер (127.0.0.1) или HTTPS.");
       }
 
-      const audioConstraints = {
-        echoCancellation: { ideal: true },
-        noiseSuppression: { ideal: true },
-        autoGainControl: { ideal: true },
-        channelCount: 1
-      };
+      const forceNewAudio = Boolean(options.forceNewAudio);
+      const forceNewVideo = Boolean(options.forceNewVideo);
+
+      // Пункт 5 и 7: Не создаём лишний MediaStream, если существующий ещё действителен
+      if (localStream && !forceNewAudio && hasLiveAudioTrack(localStream)) {
+        if (type === "audio" || (type === "video" && !forceNewVideo && hasLiveVideoTrack(localStream))) {
+          localStream.getAudioTracks().forEach(t => bindAudioTrackListeners(t));
+          localStream.getVideoTracks().forEach(t => bindVideoTrackListeners(t));
+          syncMicMuteState();
+          syncVideoMuteState();
+          return localStream;
+        }
+        // Если аудиопоток уже живой, а нужен только видеотрек для видеозвонка
+        if (type === "video") {
+          try {
+            const videoOnlyStream = await navigator.mediaDevices.getUserMedia({
+              audio: false,
+              video: currentCameraDeviceId
+                ? { deviceId: { ideal: currentCameraDeviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
+                : { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }
+            });
+            const newVTrack = videoOnlyStream.getVideoTracks()[0];
+            if (newVTrack) {
+              localStream.getVideoTracks().forEach(oldV => {
+                try { localStream.removeTrack(oldV); oldV.stop(); } catch (e) {}
+              });
+              bindVideoTrackListeners(newVTrack);
+              localStream.addTrack(newVTrack);
+            }
+          } catch (videoErr) {
+            showToast("Камера недоступна. Продолжаем аудиозвонок...");
+          }
+          syncMicMuteState();
+          syncVideoMuteState();
+          return localStream;
+        }
+      }
+
+      const audioConstraints = getAudioConstraints(currentAudioDeviceId);
 
       if (type === 'video') {
         try {
-          return await navigator.mediaDevices.getUserMedia({
+          const stream = await navigator.mediaDevices.getUserMedia({
             audio: audioConstraints,
-            video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }
+            video: currentCameraDeviceId
+              ? { deviceId: { ideal: currentCameraDeviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
+              : { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }
           });
+          stream.getAudioTracks().forEach(t => bindAudioTrackListeners(t));
+          stream.getVideoTracks().forEach(t => bindVideoTrackListeners(t));
+          return stream;
         } catch (videoErr) {
           showToast("Камера недоступна. Переключаем на аудиозвонок...");
           try {
-            return await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+            stream.getAudioTracks().forEach(t => bindAudioTrackListeners(t));
+            return stream;
           } catch (audioErr) {
-            throw new Error("Разрешите доступ к микрофону в браузере");
+            // Если выбранный deviceId более недоступен, пробуем дефолтный микрофон
+            if (currentAudioDeviceId) {
+              try {
+                const fallbackStream = await navigator.mediaDevices.getUserMedia({ audio: getAudioConstraints(null) });
+                fallbackStream.getAudioTracks().forEach(t => bindAudioTrackListeners(t));
+                return fallbackStream;
+              } catch (fallbackErr) {
+                throw fallbackErr;
+              }
+            }
+            throw audioErr;
           }
         }
       } else {
         try {
-          return await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+          stream.getAudioTracks().forEach(t => bindAudioTrackListeners(t));
+          return stream;
         } catch (audioErr) {
-          throw new Error("Разрешите доступ к микрофону в браузере");
+          if (currentAudioDeviceId) {
+            try {
+              const fallbackStream = await navigator.mediaDevices.getUserMedia({ audio: getAudioConstraints(null) });
+              fallbackStream.getAudioTracks().forEach(t => bindAudioTrackListeners(t));
+              return fallbackStream;
+            } catch (fallbackErr) {
+              throw fallbackErr;
+            }
+          }
+          throw audioErr;
+        }
+      }
+    }
+
+    async function attachAudioTrackToPeerConnection(audioTrack) {
+      if (!peerConnection || !audioTrack || peerConnection.signalingState === "closed") return;
+      const senders = peerConnection.getSenders ? peerConnection.getSenders() : [];
+      let audioSender = senders.find(s => s.track && s.track.kind === "audio");
+      if (!audioSender && peerConnection.getTransceivers) {
+        const transceivers = peerConnection.getTransceivers();
+        const audioTransceiver = transceivers.find(
+          t => (t.sender && t.sender.track && t.sender.track.kind === "audio") ||
+               (t.receiver && t.receiver.track && t.receiver.track.kind === "audio")
+        );
+        if (audioTransceiver && audioTransceiver.sender) {
+          audioSender = audioTransceiver.sender;
+        }
+      }
+      if (audioSender) {
+        if (audioSender.track !== audioTrack) {
+          await audioSender.replaceTrack(audioTrack);
+        }
+      } else if (localStream) {
+        peerConnection.addTrack(audioTrack, localStream);
+      }
+    }
+
+    async function recoverMicrophoneTrack(reason = "manual") {
+      if (!isCallSessionActive && !currentCallId) return false;
+      if (isRecoveringMic) return false;
+
+      // Проверяем: если текущий аудиотрек всё ещё живой и не заглушен аппаратно, не создаём новый поток
+      const existingAudio = localStream ? localStream.getAudioTracks()[0] : null;
+      if (
+        existingAudio &&
+        existingAudio.readyState === "live" &&
+        !existingAudio.muted &&
+        reason !== "force_replace"
+      ) {
+        existingAudio.enabled = !isMicMuted;
+        try {
+          await attachAudioTrackToPeerConnection(existingAudio);
+        } catch (e) {}
+        setCallMicStatus(null);
+        return true;
+      }
+
+      isRecoveringMic = true;
+      clearTimeout(micRecoveryRetryTimeout);
+      setCallMicStatus("Микрофон временно недоступен — пытаемся восстановить…");
+
+      try {
+        let newAudioStream = null;
+        try {
+          newAudioStream = await navigator.mediaDevices.getUserMedia({
+            audio: getAudioConstraints(currentAudioDeviceId),
+            video: false
+          });
+        } catch (firstErr) {
+          if (currentAudioDeviceId) {
+            newAudioStream = await navigator.mediaDevices.getUserMedia({
+              audio: getAudioConstraints(null),
+              video: false
+            });
+          } else {
+            throw firstErr;
+          }
+        }
+
+        const newAudioTrack = newAudioStream ? newAudioStream.getAudioTracks()[0] : null;
+        if (!newAudioTrack) {
+          throw new Error("Не удалось получить аудиотрек микрофона");
+        }
+
+        // Сохраняем пользовательское состояние mute/unmute (если пользователь сам выключил микрофон, он остаётся выключенным)
+        newAudioTrack.enabled = !isMicMuted;
+        bindAudioTrackListeners(newAudioTrack);
+
+        if (localStream) {
+          localStream.getAudioTracks().forEach(oldTrack => {
+            if (oldTrack !== newAudioTrack) {
+              try {
+                oldTrack.onended = null;
+                oldTrack.onmute = null;
+                oldTrack.onunmute = null;
+              } catch (e) {}
+              try { localStream.removeTrack(oldTrack); } catch (e) {}
+              try { oldTrack.stop(); } catch (e) {}
+            }
+          });
+          localStream.addTrack(newAudioTrack);
+        } else {
+          localStream = new MediaStream([newAudioTrack]);
+        }
+
+        await attachAudioTrackToPeerConnection(newAudioTrack);
+        syncMicMuteState();
+        setCallMicStatus(null);
+        return true;
+      } catch (err) {
+        const errName = err && err.name ? err.name : "";
+        const friendlyMsg = formatMediaError(err);
+
+        if (errName === "NotAllowedError" || errName === "PermissionDeniedError" || errName === "SecurityError") {
+          setCallMicStatus(friendlyMsg, true);
+          showToast(friendlyMsg);
+        } else {
+          // Для NotReadableError / AbortError / временной блокировки ОС планируем повторную попытку
+          setCallMicStatus("Микрофон временно недоступен — пытаемся восстановить…", false);
+          if ((isCallSessionActive || currentCallId) && document.visibilityState === "visible") {
+            clearTimeout(micRecoveryRetryTimeout);
+            micRecoveryRetryTimeout = setTimeout(() => {
+              if (isCallSessionActive || currentCallId) {
+                recoverMicrophoneTrack("retry_after_error").catch(() => {});
+              }
+            }, 1500);
+          }
+        }
+        return false;
+      } finally {
+        isRecoveringMic = false;
+      }
+    }
+
+    async function recoverVideoTrack(reason = "video_recover") {
+      if ((!isCallSessionActive && !currentCallId) || currentCallType !== "video" || isVideoOff) return false;
+      if (isRecoveringVideo) return false;
+
+      const existingVideo = localStream ? localStream.getVideoTracks()[0] : null;
+      if (existingVideo && existingVideo.readyState === "live") {
+        existingVideo.enabled = !isVideoOff;
+        return true;
+      }
+
+      isRecoveringVideo = true;
+      try {
+        const vStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: currentCameraDeviceId
+            ? { deviceId: { ideal: currentCameraDeviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
+            : { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }
+        });
+        const newVTrack = vStream.getVideoTracks()[0];
+        if (!newVTrack) return false;
+
+        await waitForTrackReady(newVTrack, 1500);
+        bindVideoTrackListeners(newVTrack);
+        newVTrack.enabled = !isVideoOff;
+
+        if (localStream) {
+          localStream.getVideoTracks().forEach(oldV => {
+            if (oldV !== newVTrack) {
+              try { oldV.onended = null; } catch (e) {}
+              try { localStream.removeTrack(oldV); } catch (e) {}
+              try { oldV.stop(); } catch (e) {}
+            }
+          });
+          localStream.addTrack(newVTrack);
+        } else {
+          localStream = new MediaStream([newVTrack]);
+        }
+
+        if (peerConnection && peerConnection.signalingState !== "closed") {
+          const vSender = peerConnection.getSenders().find(s => s.track && s.track.kind === "video");
+          if (vSender) {
+            await vSender.replaceTrack(newVTrack);
+          } else {
+            peerConnection.addTrack(newVTrack, localStream);
+          }
+        }
+
+        if (localVideoElem) {
+          localVideoElem.srcObject = localStream;
+          applyLocalMirror(newVTrack);
+          localVideoElem.play().catch(() => {});
+        }
+        syncVideoMuteState();
+        return true;
+      } catch (e) {
+        return false;
+      } finally {
+        isRecoveringVideo = false;
+      }
+    }
+
+    async function attemptIceRecovery(reason = "ice_recovery") {
+      if (!peerConnection || (!isCallSessionActive && !currentCallId) || isReconnectingIce) return;
+      if (peerConnection.signalingState === "closed") return;
+
+      isReconnectingIce = true;
+      setCallMicStatus("Восстанавливаем соединение звонка…");
+
+      try {
+        if (typeof peerConnection.restartIce === "function") {
+          try { peerConnection.restartIce(); } catch (e) {}
+        }
+
+        if (currentCallRole === "caller" && currentCallId && peerConnection.signalingState === "stable") {
+          const reoffer = await peerConnection.createOffer({ iceRestart: true });
+          await peerConnection.setLocalDescription(reoffer);
+          await setDoc(doc(db, "calls", currentCallId), {
+            reoffer: { type: reoffer.type, sdp: reoffer.sdp, ts: Date.now() }
+          }, { merge: true });
+        }
+      } catch (e) {
+      } finally {
+        setTimeout(() => {
+          isReconnectingIce = false;
+        }, 2500);
+      }
+    }
+
+    function attachPeerConnectionMonitors(pc) {
+      if (!pc) return;
+
+      const checkConnectionHealth = () => {
+        if (!pc || (!isCallSessionActive && !currentCallId)) return;
+        const iceState = pc.iceConnectionState;
+        const connState = pc.connectionState;
+
+        if (iceState === "connected" || iceState === "completed" || connState === "connected") {
+          clearTimeout(iceDisconnectTimeout);
+          isReconnectingIce = false;
+          if (hasLiveAudioTrack(localStream)) {
+            const aTrack = localStream.getAudioTracks()[0];
+            if (aTrack && !aTrack.muted) {
+              setCallMicStatus(null);
+            }
+          }
+          if (remoteAudioElem && remoteAudioElem.srcObject && remoteAudioElem.paused) {
+            remoteAudioElem.play().catch(() => {});
+          }
+          if (currentCallType === "video" && remoteVideoElem && remoteVideoElem.srcObject && remoteVideoElem.paused) {
+            remoteVideoElem.play().catch(() => {});
+          }
+        } else if (iceState === "disconnected" || connState === "disconnected") {
+          setCallMicStatus("Соединение нестабильно — пытаемся восстановить…");
+          clearTimeout(iceDisconnectTimeout);
+          iceDisconnectTimeout = setTimeout(() => {
+            if (!pc || (!isCallSessionActive && !currentCallId)) return;
+            if (
+              pc.iceConnectionState === "disconnected" ||
+              pc.iceConnectionState === "failed" ||
+              pc.connectionState === "disconnected" ||
+              pc.connectionState === "failed"
+            ) {
+              attemptIceRecovery("disconnected_timeout").catch(() => {});
+            }
+          }, 3500);
+        } else if (iceState === "failed" || connState === "failed") {
+          clearTimeout(iceDisconnectTimeout);
+          setCallMicStatus("Потеря WebRTC-соединения — переподключаемся…");
+          attemptIceRecovery("connection_failed").catch(() => {});
+        }
+      };
+
+      pc.oniceconnectionstatechange = checkConnectionHealth;
+      pc.onconnectionstatechange = checkConnectionHealth;
+    }
+
+    async function ensureCallMediaAndConnection(reason = "visibility_visible") {
+      if (!isCallSessionActive && !currentCallId) return;
+
+      // 1. Возобновляем воспроизведение удалённого аудио/видео, если браузер приостановил элементы в фоне
+      if (remoteAudioElem && remoteAudioElem.srcObject && remoteAudioElem.paused) {
+        remoteAudioElem.play().catch(() => {});
+      }
+      if (currentCallType === "video") {
+        if (remoteVideoElem && remoteVideoElem.srcObject && remoteVideoElem.paused) {
+          remoteVideoElem.play().catch(() => {});
+        }
+        if (localVideoElem && localVideoElem.srcObject && localVideoElem.paused) {
+          localVideoElem.play().catch(() => {});
+        }
+      }
+
+      // 2. Проверяем состояние MediaStream и MediaStreamTrack.readyState
+      const audioTrack = localStream ? localStream.getAudioTracks()[0] : null;
+
+      if (audioTrack && audioTrack.readyState === "live") {
+        // Если браузер временно пометил трек как muted в фоне, даём ему короткое окно на автоматический unmute
+        if (audioTrack.muted) {
+          await waitForTrackReady(audioTrack, 650);
+        }
+
+        if (audioTrack.readyState === "live" && !audioTrack.muted) {
+          // Поток жив — продолжаем использовать существующий MediaStream без лишнего getUserMedia()
+          syncMicMuteState();
+          try {
+            await attachAudioTrackToPeerConnection(audioTrack);
+          } catch (e) {}
+          setCallMicStatus(null);
+        } else {
+          // Браузер/ОС заблокировал или остановил захват звука в фоне — восстанавливаем микрофон
+          await recoverMicrophoneTrack(reason);
+        }
+      } else {
+        // Аудиотрек отсутствует или перешёл в readyState === "ended" — восстанавливаем микрофон
+        await recoverMicrophoneTrack(reason);
+      }
+
+      // 3. Если это видеозвонок и камера была включена, проверяем видеотрек
+      if (currentCallType === "video" && !isVideoOff) {
+        const videoTrack = localStream ? localStream.getVideoTracks()[0] : null;
+        if (!videoTrack || videoTrack.readyState === "ended") {
+          await recoverVideoTrack(reason);
+        } else {
+          syncVideoMuteState();
+        }
+      }
+
+      // 4. Проверяем состояние WebRTC PeerConnection
+      if (peerConnection && peerConnection.signalingState !== "closed") {
+        const iceState = peerConnection.iceConnectionState;
+        const connState = peerConnection.connectionState;
+        if (
+          iceState === "disconnected" ||
+          iceState === "failed" ||
+          connState === "disconnected" ||
+          connState === "failed"
+        ) {
+          await attemptIceRecovery(reason);
         }
       }
     }
@@ -6033,14 +6806,25 @@
           setTimeout(resolve, 50);
           return;
         }
-        const t = setTimeout(() => resolve(), timeoutMs);
-        const done = () => {
+        const prevOnUnmute = track.onunmute;
+        const finish = () => {
           clearTimeout(t);
-          try { track.onunmute = null; } catch (e) {}
+          track.removeEventListener?.("unmute", finish);
           setTimeout(resolve, 50);
         };
-        track.onunmute = done;
-        if (track.readyState === "ended") done();
+        const t = setTimeout(() => {
+          track.removeEventListener?.("unmute", finish);
+          resolve();
+        }, timeoutMs);
+        if (track.addEventListener) {
+          track.addEventListener("unmute", finish, { once: true });
+        } else {
+          track.onunmute = () => {
+            if (typeof prevOnUnmute === "function") prevOnUnmute();
+            finish();
+          };
+        }
+        if (track.readyState === "ended") finish();
       });
     }
 
@@ -6078,19 +6862,26 @@
 
     async function initiateCall(type) {
       if (!activeChatUser || activeChatUser === "phonogramm") return;
-      if (currentCallId) {
+      if (currentCallId || isCallSessionActive) {
         showToast("Вы уже находитесь в звонке");
         return;
       }
 
+      isCallSessionActive = true;
+      currentCallRole = "caller";
+      currentCallPartner = activeChatUser;
       currentCallType = type;
       callPartnerDisplay.textContent = "@" + activeChatUser;
       callTimerDisplay.textContent = "Вызов...";
+      setCallMicStatus(null);
       callScreenOverlay.style.display = "flex";
       candidateQueue = [];
       currentCameraDeviceId = null;
+      lastProcessedOfferSdp = null;
+      lastProcessedAnswerSdp = null;
 
-      setupCallUI(type, activeChatUser);
+      // Инициализируем UI звонка со сбросом состояния mute только при старте нового звонка
+      setupCallUI(type, activeChatUser, true);
 
       try {
         localStream = await acquireUserMediaSafely(type);
@@ -6098,7 +6889,8 @@
         const hasVideo = localStream.getVideoTracks().length > 0;
         const effectiveType = hasVideo ? 'video' : 'audio';
         currentCallType = effectiveType;
-        setupCallUI(effectiveType, activeChatUser);
+        // Повторный вызов setupCallUI НЕ сбрасывает isMicMuted / isVideoOff
+        setupCallUI(effectiveType, activeChatUser, false);
 
         if (hasVideo) {
           const vTrack = localStream.getVideoTracks()[0];
@@ -6116,7 +6908,11 @@
           callAudioAvatar.style.display = "flex";
         }
 
+        syncMicMuteState();
+        syncVideoMuteState();
+
         peerConnection = new RTCPeerConnection(rtcConfig);
+        attachPeerConnectionMonitors(peerConnection);
         localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
 
         peerConnection.ontrack = (event) => {
@@ -6125,6 +6921,7 @@
             remoteVideoElem.srcObject = stream;
             remoteVideoElem.style.display = "block";
             remoteVideoElem.muted = false;
+            remoteVideoElem.play().catch(() => {});
             callAudioAvatar.style.display = "none";
             remoteAudioElem.srcObject = null;
           } else {
@@ -6184,6 +6981,7 @@
             clearTimeout(callRingTimeout);
             stopRingtoneSound();
             await suspendAudioContext();
+            lastProcessedAnswerSdp = data.answer.sdp;
             await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
             await drainIceCandidatesQueue();
             startCallTimer();
@@ -6200,10 +6998,23 @@
                 }
               });
             });
+          } else if (
+            data.status === 'connected' &&
+            peerConnection &&
+            data.reanswer &&
+            data.reanswer.sdp &&
+            data.reanswer.sdp !== lastProcessedAnswerSdp
+          ) {
+            try {
+              lastProcessedAnswerSdp = data.reanswer.sdp;
+              await peerConnection.setRemoteDescription(new RTCSessionDescription(data.reanswer));
+              await drainIceCandidatesQueue();
+              setCallMicStatus(null);
+            } catch (e) {}
           }
         });
       } catch (err) {
-        showToast("Ошибка звонка: " + err.message);
+        showToast("Ошибка звонка: " + formatMediaError(err));
         terminateCall();
       }
     }
@@ -6282,16 +7093,22 @@
       const callData = window.activeIncomingCallData;
       if (!callId || !callData) return;
 
+      isCallSessionActive = true;
+      currentCallRole = "callee";
+      currentCallPartner = callData.caller;
       currentCallId = callId;
       currentCallType = callData.type;
       callPartnerDisplay.textContent = "@" + callData.caller;
       callTimerDisplay.textContent = "Соединение...";
+      setCallMicStatus(null);
       callScreenOverlay.style.display = "flex";
       candidateQueue = [];
       currentCameraDeviceId = null;
+      lastProcessedOfferSdp = callData.offer ? callData.offer.sdp : null;
+      lastProcessedAnswerSdp = null;
 
       await suspendAudioContext();
-      setupCallUI(callData.type, callData.caller);
+      setupCallUI(callData.type, callData.caller, true);
 
       try {
         localStream = await acquireUserMediaSafely(callData.type);
@@ -6313,7 +7130,11 @@
           callAudioAvatar.style.display = "flex";
         }
 
+        syncMicMuteState();
+        syncVideoMuteState();
+
         peerConnection = new RTCPeerConnection(rtcConfig);
+        attachPeerConnectionMonitors(peerConnection);
         localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
 
         peerConnection.ontrack = (event) => {
@@ -6322,6 +7143,7 @@
             remoteVideoElem.srcObject = stream;
             remoteVideoElem.style.display = "block";
             remoteVideoElem.muted = false;
+            remoteVideoElem.play().catch(() => {});
             callAudioAvatar.style.display = "none";
             remoteAudioElem.srcObject = null;
           } else {
@@ -6366,19 +7188,38 @@
           });
         });
 
-        unsubscribeCallDoc = onSnapshot(doc(db, "calls", callId), (snap) => {
+        unsubscribeCallDoc = onSnapshot(doc(db, "calls", callId), async (snap) => {
           const d = snap.data();
-          if (d && (d.status === 'ended' || d.status === 'rejected')) {
+          if (!d) return;
+          if (d.status === 'ended' || d.status === 'rejected') {
             terminateCall();
+          } else if (
+            d.status === 'connected' &&
+            peerConnection &&
+            d.reoffer &&
+            d.reoffer.sdp &&
+            d.reoffer.sdp !== lastProcessedOfferSdp
+          ) {
+            try {
+              lastProcessedOfferSdp = d.reoffer.sdp;
+              await peerConnection.setRemoteDescription(new RTCSessionDescription(d.reoffer));
+              await drainIceCandidatesQueue();
+              const reanswer = await peerConnection.createAnswer();
+              await peerConnection.setLocalDescription(reanswer);
+              await setDoc(doc(db, "calls", callId), {
+                reanswer: { type: reanswer.type, sdp: reanswer.sdp, ts: Date.now() }
+              }, { merge: true });
+              setCallMicStatus(null);
+            } catch (e) {}
           }
         });
       } catch (err) {
-        showToast("Ошибка ответа: " + err.message);
+        showToast("Ошибка ответа: " + formatMediaError(err));
         terminateCall();
       }
     });
 
-    function setupCallUI(type, partner) {
+    function setupCallUI(type, partner, resetMuteState = false) {
       if (type === 'video') {
         callAudioAvatar.style.display = "none";
         callToggleVideoBtn.style.display = "flex";
@@ -6395,10 +7236,12 @@
         const camBtn = document.getElementById("call-switch-camera-btn");
         if (camBtn) camBtn.style.display = "none";
       }
-      isMicMuted = false;
-      isVideoOff = false;
-      callMuteMicBtn.classList.remove("active-off");
-      callToggleVideoBtn.classList.remove("active-off");
+      if (resetMuteState) {
+        isMicMuted = false;
+        isVideoOff = false;
+      }
+      syncMicMuteState();
+      syncVideoMuteState();
     }
 
     function startCallTimer() {
@@ -6420,20 +7263,45 @@
     });
 
     function terminateCall() {
+      isCallSessionActive = false;
+      currentCallRole = null;
+      currentCallPartner = null;
+      isRecoveringMic = false;
+      isRecoveringVideo = false;
+      isReconnectingIce = false;
+      lastProcessedOfferSdp = null;
+      lastProcessedAnswerSdp = null;
+
       stopRingtoneSound();
       clearInterval(callTimerInterval);
       clearTimeout(callRingTimeout);
+      clearTimeout(micRecoveryRetryTimeout);
+      clearTimeout(iceDisconnectTimeout);
+      setCallMicStatus(null);
 
       if (unsubscribeCallDoc) { unsubscribeCallDoc(); unsubscribeCallDoc = null; }
       if (unsubscribeCallerCandidates) { unsubscribeCallerCandidates(); unsubscribeCallerCandidates = null; }
       if (unsubscribeCalleeCandidates) { unsubscribeCalleeCandidates(); unsubscribeCalleeCandidates = null; }
 
       if (peerConnection) {
-        peerConnection.close();
+        try {
+          peerConnection.oniceconnectionstatechange = null;
+          peerConnection.onconnectionstatechange = null;
+          peerConnection.ontrack = null;
+          peerConnection.onicecandidate = null;
+          peerConnection.close();
+        } catch (e) {}
         peerConnection = null;
       }
       if (localStream) {
-        localStream.getTracks().forEach(t => t.stop());
+        localStream.getTracks().forEach(t => {
+          try {
+            t.onended = null;
+            t.onmute = null;
+            t.onunmute = null;
+            t.stop();
+          } catch (e) {}
+        });
         localStream = null;
       }
 
@@ -6448,8 +7316,11 @@
       window.activeIncomingCallData = null;
       candidateQueue = [];
       currentCameraDeviceId = null;
+      currentAudioDeviceId = null;
       isMicMuted = false;
       isVideoOff = false;
+      callMuteMicBtn.classList.remove("active-off");
+      callToggleVideoBtn.classList.remove("active-off");
 
       if (activeCallNotification) {
         activeCallNotification.close();
@@ -6461,20 +7332,21 @@
       }
 
       resumeAudioContextIfNeeded().catch(() => {});
+      if (currentUsername) {
+        sendPresenceUpdate(document.visibilityState === "visible");
+      }
     }
 
     callMuteMicBtn.addEventListener("click", () => {
-      if (!localStream) return;
+      if (!isCallSessionActive && !currentCallId && !localStream) return;
       isMicMuted = !isMicMuted;
-      localStream.getAudioTracks().forEach(track => { track.enabled = !isMicMuted; });
-      callMuteMicBtn.classList.toggle("active-off", isMicMuted);
+      syncMicMuteState();
     });
 
     callToggleVideoBtn.addEventListener("click", () => {
-      if (!localStream) return;
+      if (!isCallSessionActive && !currentCallId && !localStream) return;
       isVideoOff = !isVideoOff;
-      localStream.getVideoTracks().forEach(track => { track.enabled = !isVideoOff; });
-      callToggleVideoBtn.classList.toggle("active-off", isVideoOff);
+      syncVideoMuteState();
     });
 
     async function switchCameraFacing() {
@@ -6546,13 +7418,19 @@
         }
 
         await waitForTrackReady(newTrack);
+        bindVideoTrackListeners(newTrack);
         if (isVideoOff) newTrack.enabled = false;
 
         const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === "video");
         if (sender) await sender.replaceTrack(newTrack);
 
         const audioTracks = localStream.getAudioTracks();
-        try { localStream.removeTrack(oldTrack); oldTrack.stop(); } catch (e) {}
+        audioTracks.forEach(t => { t.enabled = !isMicMuted; });
+        try {
+          oldTrack.onended = null;
+          localStream.removeTrack(oldTrack);
+          oldTrack.stop();
+        } catch (e) {}
         localStream = new MediaStream([newTrack, ...audioTracks]);
 
         localVideoElem.srcObject = localStream;
@@ -6561,6 +7439,8 @@
 
         const newSet = newTrack.getSettings ? newTrack.getSettings() : {};
         currentCameraDeviceId = newSet.deviceId || null;
+        syncMicMuteState();
+        syncVideoMuteState();
         showToast("Камера переключена 📷");
       } catch (e) {
         showToast("Ошибка смены камеры");
